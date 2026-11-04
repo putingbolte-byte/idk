@@ -1157,6 +1157,21 @@ local function startCapture()
     local hookFn = fetch("hookmetamethod")
     local methodFn = fetch("getnamecallmethod")
 
+    -- read the live metamethod BEFORE installing anything. the wrapper gets its
+    -- own stable reference. the old code called back through capture.original,
+    -- a mutable table field — a second run could repoint it at the new wrapper
+    -- while the old one was still installed, and then every remote call in the
+    -- game recursed into itself. that is what killed reload and shove.
+    local passThrough = nil
+    pcall(function()
+        if has("getrawmetatable") then
+            local mt = fetch("getrawmetatable")(game)
+            if mt then
+                passThrough = rawget(mt, "__namecall")
+            end
+        end
+    end)
+
     local wrapper = function(self, ...)
         local method = methodFn()
         if method == "FireServer" or method == "InvokeServer"
@@ -1189,7 +1204,9 @@ local function startCapture()
                 end
             end
         end
-        return capture.original(self, ...)
+        if passThrough then
+            return passThrough(self, ...)
+        end
     end
 
     local ok, original = pcall(hookFn, game, "__namecall", wrapper)
@@ -1198,6 +1215,7 @@ local function startCapture()
         return false
     end
 
+    passThrough = passThrough or original
     capture.original = original
     capture.wrapper = wrapper
     capture.active = true
@@ -1213,34 +1231,42 @@ local function restoreNamecall()
     -- metatable write, hookfunction on the wrapper, then give up and leave it
     -- (the wrapper is a pass-through once capture.active is false, so a failed
     -- restore costs speed, not behaviour)
+    local wrapper = capture.wrapper
+    local original = capture.original
     local restored = false
 
-    if has("getrawmetatable") and has("setreadonly") then
-        local setreadonly = fetch("setreadonly")
-        local ok = pcall(function()
+    -- path 1: put the raw metatable entry back, then VERIFY it landed. the old
+    -- code trusted pcall's success flag, so a no-op write still counted as a
+    -- restore and the wrapper stayed on the metatable forever.
+    if has("getrawmetatable") and has("setreadonly") and original then
+        pcall(function()
             local mt = fetch("getrawmetatable")(game)
-            if mt and rawget(mt, "__namecall") == capture.wrapper then
-                setreadonly(mt, false)
-                rawset(mt, "__namecall", capture.original)
-                setreadonly(mt, true)
-                restored = true
+            if not mt or rawget(mt, "__namecall") ~= wrapper then
+                return
             end
+            fetch("setreadonly")(mt, false)
+            rawset(mt, "__namecall", original)
+            fetch("setreadonly")(mt, true)
+            restored = (rawget(mt, "__namecall") == original)
         end)
-        restored = restored or ok
     end
 
-    if not restored and has("hookfunction") then
-        local ok = pcall(fetch("hookfunction"), capture.wrapper, capture.original)
-        restored = ok
+    -- path 2: rewrite the wrapper function in place
+    if not restored and has("hookfunction") and original then
+        restored = pcall(fetch("hookfunction"), wrapper, original)
     end
 
-    if not restored and has("hookmetamethod") then
-        pcall(fetch("hookmetamethod"), game, "__namecall", capture.original)
+    -- path 3: install the original through the same door the hook came in
+    if not restored and has("hookmetamethod") and original then
+        pcall(fetch("hookmetamethod"), game, "__namecall", original)
         restored = true
     end
 
     if restored then
         capture.wrapper = nil
+    else
+        addLine("namecall restore failed — wrapper is pass-through, controls still work",
+            COL.amber)
     end
     return restored
 end
