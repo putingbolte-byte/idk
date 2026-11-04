@@ -2317,6 +2317,7 @@ end
 ----------------------------------------------------------------------------
 
 local busy = false
+local captureArmed = false
 local captureTimer = nil
 
 local function finishMeta(started)
@@ -2535,6 +2536,30 @@ captureButton.Activated:Connect(function()
         setStatus("CAPTURED", ("%d remotes"):format(total), COL.green)
         return
     end
+
+    -- two taps. the first one only warns. if the client dies on the second,
+    -- you at least did it on purpose.
+    if not captureArmed then
+        captureArmed = true
+        captureButton.Text = "SURE?"
+        setStatus("hooks __namecall — can crash the client. tap again to arm.", COL.amber)
+        addLine("capture armed for confirmation. tap SURE? to actually hook.", COL.amber)
+        task.delay(5, function()
+            if captureArmed then
+                captureArmed = false
+                pcall(function()
+                    captureButton.Text = "CAPTURE"
+                end)
+            end
+        end)
+        return
+    end
+
+    captureArmed = false
+    pcall(function()
+        captureButton.Text = "CAPTURE"
+    end)
+
     if startCapture() then
         setStatus("CAPTURING", ("%ds"):format(CONFIG.captureWindow), COL.violet)
         addLine("capture armed. play normally.", COL.violet)
