@@ -2847,7 +2847,7 @@ note("log",
     COL.sub)
 
 local logToggle
-logToggle = toggle("log", "arm logger", false, function(on)
+logToggle = toggle("log", "arm logger (hook — may crash)", false, function(on)
     if on then
         local started = startLog()
         if not started then
@@ -2860,7 +2860,11 @@ logToggle = toggle("log", "arm logger", false, function(on)
     else
         stopLog()
     end
-    setStatus(on and "logger armed" or "logger off", on and COL.green or COL.sub)
+    if on then
+        setStatus("logger armed — hooks __namecall, rejoin if the client dies", COL.amber)
+    else
+        setStatus("logger off", COL.sub)
+    end
 end)
 
 local logList = new("Frame", {
