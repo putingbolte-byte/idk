@@ -33,15 +33,22 @@
       ReplicatedStorage.AdminPanelRemotes.*
       ReplicatedStorage.GS_AdminPanelV2.*
 
-    four things in here do not touch the server at all:
+    six things in here do not touch the server at all:
 
       1. ESP            — pure client, Highlight + billboards
-      2. visuals        — fullbright, no fog, FOV
-      3. movement       — speed, jump, fly, noclip, teleport
-      4. spoof          — fires a remote's OWN OnClientEvent handlers locally
+      2. infected ESP   — L4D2 cast detection: players in a special class,
+                          npc models in workspace. coloured per class.
+      3. aim assist     — camera lock with wall check + team check, bound
+                          after the game's camera script
+      4. visuals        — fullbright, no fog, FOV
+      5. movement       — speed, jump, fly, noclip, teleport
+      6. spoof          — fires a remote's OWN OnClientEvent handlers locally
                           with whatever args you type. fake kill feed, fake
                           announcement, fake damage markers, fake cutscene.
                           the server never sees it, so it is free.
+
+    auto fire is not a remote spam. it presses the game's own DSFire button,
+    which is the exact same handler a thumb tap runs — no payload guessing.
 
     the logger is the one that pays for itself: it records every real
     FireServer/InvokeServer with the typeof of each argument, so you can read
@@ -103,6 +110,25 @@ local function try(fn, ...)
         return value
     end
     return nil
+end
+
+-- os.clock() is CPU time, not wall time. every deadline built on it is a lie
+-- once the code starts yielding, which is how a hung RemoteFunction locks the
+-- whole menu. real clock only.
+local function wallNow()
+    local ok, millis = pcall(function()
+        return DateTime.now().UnixTimestampMillis
+    end)
+    if ok and type(millis) == "number" then
+        return millis / 1000
+    end
+    local okTick, value = pcall(function()
+        return tick()
+    end)
+    if okTick and type(value) == "number" then
+        return value
+    end
+    return os.time()
 end
 
 ----------------------------------------------------------------------------
@@ -344,7 +370,7 @@ end
 -- tab rail
 ----------------------------------------------------------------------------
 
-local TABS = { "esp", "vis", "move", "spoof", "log", "srv" }
+local TABS = { "esp", "zomb", "combat", "vis", "move", "spoof", "log", "srv" }
 local TAB_W = 62
 
 local rail = new("ScrollingFrame", {
@@ -1582,19 +1608,549 @@ local function stopLog()
 end
 
 ----------------------------------------------------------------------------
+-- infected detection
+--
+-- deadshift's own internals name the L4D2 cast — the recon report lists
+-- BoomerApprovedData, ChargerApprovedData, HunterApprovedData, JockeyApprovedData,
+-- SmokerApprovedData and TankV2ApprovedData as top-level ReplicatedStorage
+-- folders, plus a "Zombie Survival Animation Pack (R15)". so the infected are
+-- the usual six. in versus they are PLAYERS wearing those classes, in survival
+-- they are npc models in workspace. both get handled.
+----------------------------------------------------------------------------
+
+local INFECTED_WORDS = {
+    "boomer", "charger", "hunter", "jockey", "smoker", "tank",
+    "spitter", "witch", "zombie", "infected", "special", "horde", "common",
+}
+
+local function looksInfected(text)
+    local lowered = string.lower(tostring(text or ""))
+    for _, word in ipairs(INFECTED_WORDS) do
+        if string.find(lowered, word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function playerInfected(player)
+    if not player then
+        return false
+    end
+
+    local okTeam, team = pcall(function()
+        return player.Team
+    end)
+    if okTeam and team and looksInfected(team.Name) then
+        return true
+    end
+
+    local char = player.Character
+    if not char then
+        return false
+    end
+    if looksInfected(char.Name) then
+        return true
+    end
+    for _, child in ipairs(char:GetChildren()) do
+        if looksInfected(child.Name) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isPlayerCharacter(model)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character == model then
+            return player
+        end
+    end
+    return nil
+end
+
+-- workspace descendant walk is the only reliable way to find npc infected —
+-- the report shows them as plain workspace models, not under a known folder.
+-- throttled hard, because a full walk on a 6k-part map is not cheap on mobile.
+local npcCache = {}
+local npcCacheAt = 0
+
+local function scanNpcInfected()
+    local clock = wallNow()
+    if clock - npcCacheAt < 2.5 then
+        return npcCache
+    end
+    npcCacheAt = clock
+
+    local list = {}
+    local ok, descendants = pcall(function()
+        return workspace:GetDescendants()
+    end)
+    if not ok or type(descendants) ~= "table" then
+        return npcCache
+    end
+
+    for _, inst in ipairs(descendants) do
+        if inst:IsA("Humanoid") then
+            local model = inst.Parent
+            if model and model:IsA("Model")
+                and not isPlayerCharacter(model)
+                and inst.Health > 0 then
+                list[#list + 1] = model
+            end
+        end
+    end
+
+    npcCache = list
+    return list
+end
+
+----------------------------------------------------------------------------
+-- infected esp
+----------------------------------------------------------------------------
+
+local zombEsp = {
+    enabled = false,
+    npcOnly = false,
+    showHealth = true,
+    showDistance = true,
+    maxDistance = 900,
+    entries = {},
+}
+
+local function clearZombEsp()
+    for key, data in pairs(zombEsp.entries) do
+        for _, inst in ipairs({ data.highlight, data.billboard }) do
+            if inst then
+                pcall(function()
+                    inst:Destroy()
+                end)
+            end
+        end
+        zombEsp.entries[key] = nil
+    end
+end
+
+local function makeMarker(model, label, color)
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "ds_zomb"
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillColor = color
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = color
+    highlight.OutlineTransparency = 0.1
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "ds_zomb"
+    billboard.Size = UDim2.fromOffset(130, 32)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 5000
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0, 14)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 12
+    nameLabel.TextColor3 = color
+    nameLabel.TextStrokeTransparency = 0.35
+    nameLabel.Text = label
+    nameLabel.Parent = billboard
+
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Position = UDim2.fromOffset(0, 14)
+    infoLabel.Size = UDim2.new(1, 0, 0, 12)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.Font = Enum.Font.Code
+    infoLabel.TextSize = 10
+    infoLabel.TextColor3 = COL.sub
+    infoLabel.TextStrokeTransparency = 0.35
+    infoLabel.Text = ""
+    infoLabel.Parent = billboard
+
+    pcall(function()
+        highlight.Parent = model
+        billboard.Parent = model
+    end)
+
+    return {
+        highlight = highlight,
+        billboard = billboard,
+        infoLabel = infoLabel,
+    }
+end
+
+local function classColor(name)
+    local lowered = string.lower(tostring(name or ""))
+    if string.find(lowered, "tank", 1, true) then
+        return Color3.fromRGB(255, 96, 96)
+    elseif string.find(lowered, "witch", 1, true) then
+        return Color3.fromRGB(255, 150, 220)
+    elseif string.find(lowered, "hunter", 1, true) then
+        return Color3.fromRGB(150, 210, 255)
+    elseif string.find(lowered, "smoker", 1, true) then
+        return Color3.fromRGB(170, 255, 180)
+    elseif string.find(lowered, "boomer", 1, true) then
+        return Color3.fromRGB(200, 255, 120)
+    elseif string.find(lowered, "charger", 1, true) then
+        return Color3.fromRGB(255, 190, 110)
+    elseif string.find(lowered, "jockey", 1, true) then
+        return Color3.fromRGB(230, 180, 255)
+    elseif string.find(lowered, "spitter", 1, true) then
+        return Color3.fromRGB(140, 255, 130)
+    end
+    return Color3.fromRGB(190, 255, 120)
+end
+
+local function syncZombEsp()
+    if not zombEsp.enabled then
+        clearZombEsp()
+        return
+    end
+
+    local myRoot = root()
+    local myPos = myRoot and myRoot.Position or nil
+    local seen = {}
+
+    local function consider(key, model, label, color)
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then
+            return
+        end
+
+        local okPart, pivot = pcall(function()
+            return model:GetPivot().Position
+        end)
+        local pos = okPart and pivot or nil
+
+        local distance = 0
+        if myPos and pos then
+            distance = (pos - myPos).Magnitude
+        end
+        if distance > zombEsp.maxDistance then
+            return
+        end
+
+        seen[key] = true
+        local data = zombEsp.entries[key]
+        if not data then
+            data = makeMarker(model, label, color)
+            zombEsp.entries[key] = data
+        elseif data.highlight and data.highlight.Parent ~= model then
+            pcall(function()
+                data.highlight.Parent = model
+                data.billboard.Parent = model
+            end)
+        end
+
+        if data and data.infoLabel then
+            local bits = {}
+            if zombEsp.showHealth then
+                bits[#bits + 1] = ("%d hp"):format(math.floor(humanoid.Health))
+            end
+            if zombEsp.showDistance then
+                bits[#bits + 1] = ("%d studs"):format(math.floor(distance))
+            end
+            data.infoLabel.Text = table.concat(bits, "  ")
+        end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= lp and zombEsp.npcOnly ~= true then
+            local char = player.Character
+            if char and playerInfected(player) then
+                local teamName = "infected"
+                pcall(function()
+                    if player.Team then
+                        teamName = player.Team.Name
+                    end
+                end)
+                consider("p:" .. player.Name, char, player.Name .. "  [" .. teamName .. "]",
+                    classColor(teamName .. " " .. char.Name))
+            end
+        end
+    end
+
+    for _, model in ipairs(scanNpcInfected()) do
+        consider("n:" .. model:GetFullName(), model, model.Name, classColor(model.Name))
+    end
+
+    for key, data in pairs(zombEsp.entries) do
+        if not seen[key] then
+            for _, inst in ipairs({ data.highlight, data.billboard }) do
+                if inst then
+                    pcall(function()
+                        inst:Destroy()
+                    end)
+                end
+            end
+            zombEsp.entries[key] = nil
+        end
+    end
+end
+
+----------------------------------------------------------------------------
+-- combat: aim assist + the game's own fire button
+--
+-- the game already paints its mobile controls into PlayerGui, which means the
+-- fire path is a normal TextButton handler we can poke. that is worth more than
+-- guessing at DeadshiftPrototype.Action's payload — it fires exactly what the
+-- game fires when a thumb hits the button.
+----------------------------------------------------------------------------
+
+local function guiButton(name)
+    local playerGui = lp:FindFirstChild("PlayerGui")
+    if not playerGui then
+        return nil
+    end
+    local ok, found = pcall(function()
+        return playerGui:FindFirstChild(name, true)
+    end)
+    return (ok and found) or nil
+end
+
+local function pressButton(button)
+    if not button then
+        return false
+    end
+
+    if have("getconnections") then
+        local list = nil
+        pcall(function()
+            list = EXEC.getconnections(button.Activated)
+        end)
+        if type(list) == "table" and #list > 0 then
+            local pressed = false
+            for _, conn in ipairs(list) do
+                local ok = pcall(function()
+                    conn.Fire()
+                end)
+                if ok then
+                    pressed = true
+                end
+            end
+            if pressed then
+                return true
+            end
+        end
+    end
+
+    local ok = pcall(function()
+        button.MouseButton1Click:Fire()
+    end)
+    return ok
+end
+
+local aim = {
+    enabled = false,
+    fov = 260,
+    smooth = 0.25,
+    wallCheck = true,
+    teamCheck = true,
+    infectedOnly = true,
+    autoFire = false,
+    fireDelay = 0.1,
+    maxRange = 800,
+}
+
+local lastFire = 0
+local aimTargetName = nil
+
+local function collectTargets()
+    local list = {}
+    local fallbacks = {}
+    local myTeam = nil
+    local anyInfectedPlayer = false
+    pcall(function()
+        myTeam = lp.Team
+    end)
+
+    local function sameTeam(player)
+        if not myTeam then
+            return false
+        end
+        local theirTeam = nil
+        pcall(function()
+            theirTeam = player.Team
+        end)
+        return theirTeam == myTeam
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= lp then
+            local char = player.Character
+            if char then
+                local humanoid = char:FindFirstChildOfClass("Humanoid")
+                local part = char:FindFirstChild("HumanoidRootPart")
+                    or char:FindFirstChild("Head")
+                if humanoid and part and humanoid.Health > 0 then
+                    local infected = playerInfected(player)
+                    if infected then
+                        anyInfectedPlayer = true
+                    end
+
+                    local entry = {
+                        part = part,
+                        label = player.Name,
+                        infected = infected,
+                        model = char,
+                    }
+
+                    if aim.teamCheck and sameTeam(player) then
+                        -- never
+                    elseif aim.infectedOnly and not infected then
+                        table.insert(fallbacks, entry)
+                    else
+                        table.insert(list, entry)
+                    end
+                end
+            end
+        end
+    end
+
+    -- class detection can miss (team not named "infected", no special children).
+    -- if the server shows no infected players at all, do not sit there aiming at
+    -- nothing — fall back to whoever is not on your team.
+    if aim.infectedOnly and not anyInfectedPlayer then
+        for _, entry in ipairs(fallbacks) do
+            table.insert(list, entry)
+        end
+    end
+
+    for _, model in ipairs(scanNpcInfected()) do
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        local part = model:FindFirstChild("Head")
+            or model:FindFirstChild("HumanoidRootPart")
+        if humanoid and part and humanoid.Health > 0 then
+            list[#list + 1] = {
+                part = part,
+                label = model.Name,
+                infected = true,
+                model = model,
+            }
+        end
+    end
+
+    return list
+end
+
+local function raycastParams()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = {}
+    local char = character()
+    if char then
+        ignore[#ignore + 1] = char
+    end
+    local camera = workspace.CurrentCamera
+    if camera then
+        ignore[#ignore + 1] = camera
+    end
+    params.FilterDescendantsInstances = ignore
+    return params
+end
+
+local function hasLineOfSight(fromPos, toPart)
+    if not aim.wallCheck then
+        return true
+    end
+    local ok, result = pcall(function()
+        return workspace:Raycast(fromPos, toPart.Position - fromPos, raycastParams())
+    end)
+    if not ok then
+        return true
+    end
+    if not result then
+        return true
+    end
+    -- a hit is only a wall if it is not the target's own character
+    return result.Instance and result.Instance:IsDescendantOf(toPart.Parent)
+end
+
+local function closestTarget(camera, center)
+    local best = nil
+    local bestScore = math.huge
+
+    for _, target in ipairs(collectTargets()) do
+        local ok, point, onScreen = pcall(function()
+            return camera:WorldToViewportPoint(target.part.Position)
+        end)
+        if ok and onScreen and point.Z > 0 then
+            local screenPos = Vector2.new(point.X, point.Y)
+            local distance = (screenPos - center).Magnitude
+            if distance <= aim.fov then
+                local angle = (target.part.Position - camera.CFrame.Position).Magnitude
+                if angle <= aim.maxRange and distance < bestScore then
+                    if hasLineOfSight(camera.CFrame.Position, target.part) then
+                        bestScore = distance
+                        best = target
+                    end
+                end
+            end
+        end
+    end
+
+    return best, bestScore
+end
+
+local function aimStep()
+    if not aim.enabled then
+        aimTargetName = nil
+        return
+    end
+
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local viewport = camera.ViewportSize
+    local center = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+    local target, score = closestTarget(camera, center)
+
+    if not target then
+        aimTargetName = nil
+        return
+    end
+
+    aimTargetName = target.label
+
+    local goal = CFrame.lookAt(camera.CFrame.Position, target.part.Position)
+    camera.CFrame = camera.CFrame:Lerp(goal, math.clamp(aim.smooth, 0.02, 1))
+
+    if aim.autoFire then
+        local clock = wallNow()
+        if clock - lastFire >= aim.fireDelay then
+            local ok = pressButton(guiButton("DSFire"))
+            if ok then
+                lastFire = clock
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------------
 -- render loop
 ----------------------------------------------------------------------------
 
 local lastEsp = 0
+local lastZombEsp = 0
 local lastNoclip = 0
 
 task.spawn(function()
     while screen and screen.Parent do
-        local now = os.clock()
+        local now = wallNow()
 
         if espState.enabled and now - lastEsp > 0.25 then
             lastEsp = now
             pcall(syncEsp)
+        end
+
+        if now - lastZombEsp > 0.3 then
+            lastZombEsp = now
+            if zombEsp.enabled then
+                pcall(syncZombEsp)
+            end
         end
 
         if move.noclip and now - lastNoclip > 0.1 then
@@ -1617,6 +2173,18 @@ task.spawn(function()
 
         RunService.RenderStepped:Wait()
     end
+end)
+
+-- camera writes have to land AFTER the game's own camera script, or it stomps
+-- them on the same frame. Camera priority + 1 is the correct slot.
+local AIM_BIND = "deadshift_aim"
+pcall(function()
+    RunService:UnbindFromRenderStep(AIM_BIND)
+end)
+pcall(function()
+    RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
+        pcall(aimStep)
+    end)
 end)
 
 keep(UIS.JumpRequest:Connect(function()
@@ -1645,6 +2213,8 @@ end))
 ----------------------------------------------------------------------------
 
 makePage("esp")
+makePage("zomb")
+makePage("combat")
 makePage("vis")
 makePage("move")
 makePage("spoof")
@@ -1803,6 +2373,184 @@ action("esp", "spectate nearest", COL.blue, function()
     else
         setStatus("nobody to spectate", COL.amber)
     end
+end)
+
+----------------------------------------------------------------------------
+-- zomb page
+----------------------------------------------------------------------------
+
+sectionRule("infected")(("zomb"))
+
+note("zomb",
+    "highlights every infected the client can see: players wearing a special " ..
+    "class, and npc models in workspace with a live humanoid. coloured by class " ..
+    "— tank red, hunter blue, smoker green, witch pink.",
+    COL.sub)
+
+toggle("zomb", "infected esp", false, function(on)
+    zombEsp.enabled = on
+    if not on then
+        clearZombEsp()
+        setStatus("infected esp off", COL.sub)
+    else
+        syncZombEsp()
+        local count = 0
+        for _ in pairs(zombEsp.entries) do
+            count = count + 1
+        end
+        setStatus(("infected esp on — %d visible"):format(count), COL.green)
+    end
+end)
+
+toggle("zomb", "skip players (npc only)", false, function(on)
+    zombEsp.npcOnly = on
+    if zombEsp.enabled then
+        clearZombEsp()
+        syncZombEsp()
+    end
+end)
+
+toggle("zomb", "show health", true, function(on)
+    zombEsp.showHealth = on
+end)
+
+toggle("zomb", "show distance", true, function(on)
+    zombEsp.showDistance = on
+end)
+
+slider("zomb", "max distance", 100, 3000, 900, 50, function(value)
+    zombEsp.maxDistance = value
+end)
+
+action("zomb", "count infected", COL.cyan, function()
+    local players = 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= lp and playerInfected(player) then
+            players = players + 1
+        end
+    end
+    local npcs = #scanNpcInfected()
+    setStatus(("infected: %d players, %d npcs"):format(players, npcs), COL.cyan)
+end)
+
+action("zomb", "list names", COL.violet, function()
+    local names = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= lp and playerInfected(player) then
+            names[#names + 1] = "P:" .. player.Name
+        end
+    end
+    local npcCount = 0
+    for _, model in ipairs(scanNpcInfected()) do
+        npcCount = npcCount + 1
+        if npcCount <= 8 then
+            names[#names + 1] = "N:" .. model.Name
+        end
+    end
+    if #names == 0 then
+        setStatus("nothing infected in range — try during a round", COL.amber)
+    else
+        if have("setclipboard") then
+            pcall(EXEC.setclipboard, table.concat(names, ", "))
+        end
+        setStatus(table.concat(names, ", "), COL.violet)
+    end
+end)
+
+----------------------------------------------------------------------------
+-- combat page
+----------------------------------------------------------------------------
+
+sectionRule("aim")(("combat"))
+
+note("combat",
+    "moves your camera onto the closest valid target inside the fov circle, " ..
+    "after the game's camera script runs. wall check raycasts before locking. " ..
+    "auto fire presses the game's own DSFire button, so it is the exact same " ..
+    "call your thumb makes.",
+    COL.sub)
+
+toggle("combat", "aim assist", false, function(on)
+    aim.enabled = on
+    setStatus(on and "aim on" or "aim off", on and COL.green or COL.sub)
+end)
+
+slider("combat", "fov", 40, 900, 260, 10, function(value)
+    aim.fov = value
+end)
+
+slider("combat", "smoothness", 0.05, 1, 0.25, 0.05, function(value)
+    aim.smooth = value
+end)
+
+slider("combat", "max range", 100, 3000, 800, 50, function(value)
+    aim.maxRange = value
+end)
+
+toggle("combat", "wall check", true, function(on)
+    aim.wallCheck = on
+end)
+
+toggle("combat", "team check", true, function(on)
+    aim.teamCheck = on
+end)
+
+toggle("combat", "infected only", true, function(on)
+    aim.infectedOnly = on
+end)
+
+sectionRule("fire")(("combat"))
+
+toggle("combat", "auto fire", false, function(on)
+    aim.autoFire = on
+    setStatus(on and "auto fire on" or "auto fire off", on and COL.green or COL.sub)
+end)
+
+slider("combat", "fire delay", 0.02, 0.5, 0.1, 0.01, function(value)
+    aim.fireDelay = value
+end)
+
+action("combat", "single shot", COL.blue, function()
+    local pressed = pressButton(guiButton("DSFire"))
+    setStatus(pressed and "fired" or "DSFire not found", pressed and COL.green or COL.amber)
+end)
+
+action("combat", "reload now", COL.blue, function()
+    local pressed = pressButton(guiButton("DSReload"))
+    setStatus(pressed and "reloaded" or "DSReload not found",
+        pressed and COL.green or COL.amber)
+end)
+
+action("combat", "shove", COL.violet, function()
+    local pressed = pressButton(guiButton("DSShove"))
+    setStatus(pressed and "shoved" or "DSShove not found",
+        pressed and COL.green or COL.amber)
+end)
+
+action("combat", "aim down sights", COL.violet, function()
+    local pressed = pressButton(guiButton("DSAim"))
+    setStatus(pressed and "ads toggled" or "DSAim not found",
+        pressed and COL.green or COL.amber)
+end)
+
+action("combat", "who am i locked on", COL.cyan, function()
+    if aimTargetName then
+        setStatus("locked: " .. aimTargetName, COL.green)
+    else
+        setStatus("no target", COL.sub)
+    end
+end)
+
+action("combat", "rescan buttons", COL.sub, function()
+    local names = { "DSFire", "DSReload", "DSShove", "DSAim", "DSCrouch", "JumpButton" }
+    local found = {}
+    for _, name in ipairs(names) do
+        if guiButton(name) then
+            found[#found + 1] = name
+        end
+    end
+    setStatus(#found > 0 and ("found: " .. table.concat(found, " ")) or "no combat buttons",
+        #found > 0 and COL.green or COL.amber)
 end)
 
 ----------------------------------------------------------------------------
@@ -2273,8 +3021,8 @@ action("srv", "AdminGrant (no args)", COL.blood, function()
         end)()
         finished = true
     end)
-    local deadline = os.clock() + 1.5
-    while not finished and os.clock() < deadline do
+    local deadline = wallNow() + 1.5
+    while not finished and wallNow() < deadline do
         task.wait(0.05)
     end
     setStatus(finished and ("grant: " .. tostring(result)) or "grant: timeout (silent reject)",
@@ -2298,8 +3046,8 @@ action("srv", "AdminLookup (self)", COL.blood, function()
         end)()
         finished = true
     end)
-    local deadline = os.clock() + 1.5
-    while not finished and os.clock() < deadline do
+    local deadline = wallNow() + 1.5
+    while not finished and wallNow() < deadline do
         task.wait(0.05)
     end
     setStatus(finished and ("lookup: " .. tostring(result)) or "lookup: timeout",
@@ -2389,6 +3137,12 @@ end
 
 local function cleanup()
     pcall(clearEsp)
+    pcall(clearZombEsp)
+    aim.enabled = false
+    aim.autoFire = false
+    pcall(function()
+        RunService:UnbindFromRenderStep(AIM_BIND)
+    end)
     pcall(function()
         setFly(false)
     end)
