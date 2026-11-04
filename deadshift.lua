@@ -85,6 +85,9 @@ local EXEC = {
     writefile = writefile,
     loadstring = loadstring,
     getgenv = getgenv,
+    getrawmetatable = getrawmetatable,
+    setreadonly = setreadonly,
+    isreadonly = isreadonly,
 }
 
 local function have(name)
@@ -449,21 +452,6 @@ end
 local function nextOrder(page)
     page.order = page.order + 1
     return page.order
-end
-
-local function sectionFrame(name)
-    local page = pages[name]
-    local label = new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 16),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        TextSize = 10,
-        TextColor3 = COL.dim,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = string.upper(name),
-        LayoutOrder = nextOrder(page),
-    }, page.frame)
-    return label
 end
 
 local function sectionRule(title)
@@ -1005,6 +993,9 @@ local function syncEsp()
     end
 
     local seen = {}
+    local myRoot = root()
+    local myPos = myRoot and myRoot.Position or nil
+
     for _, player in ipairs(Players:GetPlayers()) do
         seen[player] = true
         local data = espState.entries[player]
@@ -1018,6 +1009,20 @@ local function syncEsp()
                 pcall(function()
                     data.highlight.Parent = char
                     data.billboard.Parent = char
+                end)
+            end
+
+            -- the max-distance slider only ever moved the billboard before, so
+            -- the highlight still painted people across the whole map.
+            if data and data.highlight then
+                local theirRoot = char:FindFirstChild("HumanoidRootPart")
+                local inRange = true
+                if myPos and theirRoot then
+                    inRange = (theirRoot.Position - myPos).Magnitude <= espState.maxDistance
+                end
+                pcall(function()
+                    data.highlight.Enabled = inRange
+                    data.billboard.Enabled = inRange
                 end)
             end
         elseif data then
@@ -1251,8 +1256,31 @@ local function setFly(on)
     end)
 end
 
+-- noclip needs to remember what it broke. without a snapshot, toggling off
+-- leaves every part un-collidable and you fall through the map forever.
+local collisionSnapshot = {}
+
 local function setNoclip(on)
     move.noclip = on
+
+    if on then
+        return
+    end
+
+    local char = character()
+    local parts = {}
+    if char then
+        parts = char:GetDescendants()
+    end
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            local original = collisionSnapshot[part]
+            pcall(function()
+                part.CanCollide = (original == nil) and true or original
+            end)
+        end
+    end
+    collisionSnapshot = {}
 end
 
 local function teleportTo(player)
@@ -1344,9 +1372,19 @@ local function spoof(inst, args)
 
     local fired = 0
     for _, conn in ipairs(list) do
+        -- executors disagree on the call shape. delta wants conn.Fire(args),
+        -- some hand out a plain function. try both before giving up.
         local ok = pcall(function()
             conn.Fire(unpack(args))
         end)
+        if not ok and type(conn) == "function" then
+            ok = pcall(conn, unpack(args))
+        end
+        if not ok then
+            ok = pcall(function()
+                conn.Fire(conn, unpack(args))
+            end)
+        end
         if ok then
             fired = fired + 1
         end
@@ -1444,6 +1482,14 @@ local function startLog()
     if log.active then
         return true
     end
+
+    -- re-arming after a stop: the hook is still on the metatable, so flipping
+    -- the flag is enough. re-hooking here would stack wrappers and log twice.
+    if log.wrapper and log.original then
+        log.active = true
+        return true
+    end
+
     if not have("hookmetamethod") or not have("getnamecallmethod") then
         setStatus("no hookmetamethod — logger off", COL.amber)
         return false
@@ -1452,6 +1498,13 @@ local function startLog()
     local methodFn = EXEC.getnamecallmethod
 
     local wrapper = function(self, ...)
+        -- the hook stays installed after stopLog (removal is executor-specific),
+        -- so the flag is the actual switch. without this check, "logger off"
+        -- kept recording every remote call forever.
+        if not log.active then
+            return log.original(self, ...)
+        end
+
         local method = methodFn()
         if method == "FireServer" or method == "InvokeServer" then
             local okType, kind = pcall(typeof, self)
@@ -1505,8 +1558,11 @@ end
 
 local function stopLog()
     log.active = false
-    -- the wrapper is pass-through once we clear the flag; a hard restore needs
-    -- rawset on the metatable and not every executor allows it here
+
+    -- the flag is the real switch; the metatable restore is a courtesy. only
+    -- clear the handle when the restore actually landed, otherwise re-arming
+    -- would think the hook is gone and silently log nothing.
+    local restored = false
     if log.wrapper and have("getrawmetatable") and have("setreadonly") then
         pcall(function()
             local mt = EXEC.getrawmetatable(game)
@@ -1514,8 +1570,14 @@ local function stopLog()
                 EXEC.setreadonly(mt, false)
                 rawset(mt, "__namecall", log.original)
                 EXEC.setreadonly(mt, true)
+                restored = true
             end
         end)
+    end
+
+    if restored then
+        log.wrapper = nil
+        log.original = nil
     end
 end
 
@@ -1541,6 +1603,10 @@ task.spawn(function()
             if char then
                 for _, part in ipairs(char:GetDescendants()) do
                     if part:IsA("BasePart") then
+                        -- snapshot once, so setNoclip(false) can put it back
+                        if collisionSnapshot[part] == nil then
+                            collisionSnapshot[part] = part.CanCollide
+                        end
                         pcall(function()
                             part.CanCollide = false
                         end)
@@ -1643,13 +1709,75 @@ end)
 
 sectionRule("teleport")(("esp"))
 
-for _, player in ipairs(Players:GetPlayers()) do
-    if player ~= lp then
-        action("esp", "→ " .. player.Name, COL.violet, function()
-            teleportTo(player)
-        end, 26)
+-- the roster changes every round. buttons are rebuilt into their own container
+-- on join/leave instead of being frozen at inject time, which is what made half
+-- the lobby unreachable after the first round started.
+local teleportHost = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    LayoutOrder = nextOrder(pages.esp),
+}, pages.esp.frame)
+new("UIListLayout", {
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, teleportHost)
+
+local function rebuildTeleportButtons()
+    for _, child in ipairs(teleportHost:GetChildren()) do
+        if child:IsA("TextButton") then
+            pcall(function()
+                child:Destroy()
+            end)
+        end
+    end
+
+    local index = 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= lp then
+            index = index + 1
+            local target = player
+            local button = new("TextButton", {
+                Size = UDim2.new(1, 0, 0, 26),
+                BackgroundColor3 = COL.violet,
+                BackgroundTransparency = 0.84,
+                BorderSizePixel = 0,
+                Text = "→ " .. player.Name,
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextColor3 = COL.text,
+                AutoButtonColor = false,
+                Active = true,
+                LayoutOrder = index,
+            }, teleportHost)
+            new("UICorner", { CornerRadius = UDim.new(0, 8) }, button)
+            new("UIStroke", {
+                Color = COL.violet,
+                Transparency = 0.6,
+                Thickness = 1,
+            }, button)
+
+            button.Activated:Connect(function()
+                local ok, err = pcall(teleportTo, target)
+                if not ok then
+                    setStatus(tostring(err), COL.red)
+                end
+            end)
+        end
     end
 end
+
+rebuildTeleportButtons()
+
+keep(Players.PlayerAdded:Connect(function()
+    task.wait(0.5)
+    pcall(rebuildTeleportButtons)
+end))
+
+keep(Players.PlayerRemoving:Connect(function()
+    task.wait(0.2)
+    pcall(rebuildTeleportButtons)
+end))
 
 action("esp", "spectate nearest", COL.blue, function()
     local myRoot = root()
@@ -1861,6 +1989,49 @@ action("spoof", "set default args", COL.sub, function()
     setStatus("args reset", COL.sub)
 end, 26)
 
+sectionRule("chaos")(("spoof"))
+
+-- fires the local handlers repeatedly. pure theatre — nothing leaves the client.
+local function spam(key, count)
+    local inst = remote(key)
+    if not inst then
+        setStatus("missing: " .. key, COL.amber)
+        return
+    end
+    local args, err = parseArgs(spoofArgs.Text ~= "" and spoofArgs.Text or "")
+    if not args then
+        setStatus(err or "bad args", COL.red)
+        return
+    end
+
+    local total = 0
+    task.spawn(function()
+        for _ = 1, count do
+            local fired = spoof(inst, args)
+            total = total + fired
+            task.wait(0.15)
+        end
+        setStatus(("spammed %s x%d (%d handler calls)"):format(key, count, total), COL.violet)
+    end)
+    setStatus(("spamming %s..."):format(key), COL.violet)
+end
+
+action("spoof", "spam killfeed x12", COL.blood, function()
+    spam("killFeed", 12)
+end, 28)
+
+action("spoof", "spam announcement x12", COL.blood, function()
+    spam("announcement", 12)
+end, 28)
+
+action("spoof", "spam damage markers x20", COL.blood, function()
+    spam("damageDir", 20)
+end, 28)
+
+action("spoof", "spam npc voice x16", COL.blood, function()
+    spam("npcSay", 16)
+end, 28)
+
 sectionRule("handler survey")(("spoof"))
 
 action("spoof", "survey client handlers", COL.cyan, function()
@@ -1887,9 +2058,17 @@ note("log",
     "off the list. tap a line to copy it.",
     COL.sub)
 
-toggle("log", "arm logger", false, function(on)
+local logToggle
+logToggle = toggle("log", "arm logger", false, function(on)
     if on then
-        startLog()
+        local started = startLog()
+        if not started then
+            -- no hookmetamethod in this executor; don't leave the switch lying
+            if logToggle then
+                logToggle.set(false)
+            end
+            return
+        end
     else
         stopLog()
     end
@@ -1897,7 +2076,10 @@ toggle("log", "arm logger", false, function(on)
 end)
 
 local logList = new("Frame", {
-    Size = UDim2.new(1, 0, 0, 260),
+    -- the page already scrolls; a fixed-height inner frame just clipped rows.
+    -- let it grow with its children instead.
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundTransparency = 1,
     LayoutOrder = nextOrder(pages.log),
 }, pages.log.frame)
