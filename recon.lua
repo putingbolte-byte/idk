@@ -350,10 +350,13 @@ do
     -- the panel.
     local dragZone = create("Frame", {
         Position = UDim2.fromOffset(0, 0),
-        Size = UDim2.new(1, -84, 1, 0),
+        Size = UDim2.new(1, -120, 1, 0),
         BackgroundTransparency = 1,
         Active = true,
-        ZIndex = 3,
+        -- sits BEHIND the header buttons. at ZIndex 3 it covered 24 of the
+        -- 30 pixels of the collapse button and ate every tap on it — that is
+        -- why "-" did nothing.
+        ZIndex = 0,
     }, header)
 
     track(dragZone.InputBegan:Connect(function(input)
