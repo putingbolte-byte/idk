@@ -1951,10 +1951,31 @@ local aim = {
     autoFire = false,
     fireDelay = 0.1,
     maxRange = 800,
+    autoReload = false,
+    magSize = 30,
 }
 
 local lastFire = 0
+local shotsFired = 0
 local aimTargetName = nil
+
+-- the game never tells us the magazine size, so we count our own presses and
+-- reload on a schedule he sets. naive, but it means the thumb never has to
+-- leave the stick mid-horde.
+local function maybeAutoReload()
+    if not aim.autoReload then
+        return
+    end
+    if shotsFired < aim.magSize then
+        return
+    end
+
+    shotsFired = 0
+    local reloadButton = guiButton("DSReload")
+    task.delay(0.05, function()
+        pcall(pressButton, reloadButton)
+    end)
+end
 
 local function collectTargets()
     local list = {}
@@ -2124,6 +2145,8 @@ local function aimStep()
             local ok = pressButton(guiButton("DSFire"))
             if ok then
                 lastFire = clock
+                shotsFired = shotsFired + 1
+                maybeAutoReload()
             end
         end
     end
@@ -2510,12 +2533,29 @@ slider("combat", "fire delay", 0.02, 0.5, 0.1, 0.01, function(value)
     aim.fireDelay = value
 end)
 
+toggle("combat", "auto reload", true, function(on)
+    aim.autoReload = on
+    setStatus(on and "auto reload on" or "auto reload off",
+        on and COL.green or COL.sub)
+end)
+
+slider("combat", "shots per mag", 1, 100, 30, 1, function(value)
+    aim.magSize = math.floor(value)
+    shotsFired = 0
+end)
+
+action("combat", "reset shot counter", COL.sub, function()
+    shotsFired = 0
+    setStatus("shot counter reset", COL.sub)
+end, 26)
+
 action("combat", "single shot", COL.blue, function()
     local pressed = pressButton(guiButton("DSFire"))
     setStatus(pressed and "fired" or "DSFire not found", pressed and COL.green or COL.amber)
 end)
 
 action("combat", "reload now", COL.blue, function()
+    shotsFired = 0
     local pressed = pressButton(guiButton("DSReload"))
     setStatus(pressed and "reloaded" or "DSReload not found",
         pressed and COL.green or COL.amber)
