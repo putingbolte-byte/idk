@@ -317,6 +317,7 @@ local collapseButton = create("TextButton", {
     TextColor3 = COL.text,
     AutoButtonColor = false,
     Active = true,
+    ZIndex = 6,
 }, header)
 create("UICorner", { CornerRadius = UDim.new(0, 8) }, collapseButton)
 
@@ -333,6 +334,7 @@ local closeButton = create("TextButton", {
     TextColor3 = COL.text,
     AutoButtonColor = false,
     Active = true,
+    ZIndex = 6,
 }, header)
 create("UICorner", { CornerRadius = UDim.new(0, 8) }, closeButton)
 
