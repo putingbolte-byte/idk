@@ -1140,15 +1140,79 @@ end
 local capture = {
     active = false,
     records = {},
-    hook = nil,
+    wrapper = nil,
     original = nil,
     count = 0,
 }
+
+-- path building without touching a single method. this is the whole crash
+-- fix: the old wrapper called self:GetFullName(), which is a __namecall, from
+-- INSIDE the __namecall hook. re-entering the hook on android executors is a
+-- stack blowout, and the client dies. property reads only from here on.
+local function pathOf(inst)
+    local parts = {}
+    local node = inst
+    local guard = 0
+    while node and node ~= game and guard < 24 do
+        local name = node.Name
+        if not name then
+            break
+        end
+        parts[#parts + 1] = name
+        node = node.Parent
+        guard = guard + 1
+    end
+
+    local out = {}
+    for i = #parts, 1, -1 do
+        out[#out + 1] = parts[i]
+    end
+    return table.concat(out, ".")
+end
+
+local function recordRemote(self, method)
+    if typeof(self) ~= "Instance" then
+        return
+    end
+
+    local full
+    local okPath, value = pcall(pathOf, self)
+    if okPath and type(value) == "string" and value ~= "" then
+        full = value
+    else
+        full = tostring(self.Name)
+    end
+
+    local key = full .. "|" .. method
+    local record = capture.records[key]
+    if record then
+        record.count = record.count + 1
+        return
+    end
+
+    capture.records[key] = {
+        path = full,
+        name = tostring(self.Name),
+        class = tostring(self.ClassName),
+        method = method,
+        count = 1,
+        first = now(),
+    }
+    capture.count = capture.count + 1
+end
 
 local function startCapture()
     if capture.active then
         return true
     end
+
+    -- already hooked from an earlier capture that was never torn down. re-arming
+    -- the flag is enough; hooking twice is how you end up with a chain.
+    if capture.wrapper then
+        capture.active = true
+        return true
+    end
+
     if not has("hookmetamethod") or not has("getnamecallmethod") then
         addLine("no hookmetamethod — runtime capture unavailable", COL.amber)
         return false
@@ -1157,66 +1221,30 @@ local function startCapture()
     local hookFn = fetch("hookmetamethod")
     local methodFn = fetch("getnamecallmethod")
 
-    -- read the live metamethod BEFORE installing anything. the wrapper gets its
-    -- own stable reference. the old code called back through capture.original,
-    -- a mutable table field — a second run could repoint it at the new wrapper
-    -- while the old one was still installed, and then every remote call in the
-    -- game recursed into itself. that is what killed reload and shove.
-    local passThrough = nil
-    pcall(function()
-        if has("getrawmetatable") then
-            local mt = fetch("getrawmetatable")(game)
-            if mt then
-                passThrough = rawget(mt, "__namecall")
-            end
-        end
-    end)
+    -- plain local upvalue, not a table field. nothing can repoint it later, so
+    -- a second run can never make an installed wrapper call itself.
+    local original
 
     local wrapper = function(self, ...)
-        local method = methodFn()
-        if capture.active and (method == "FireServer" or method == "InvokeServer"
-            or method == "FireAllClients" or method == "InvokeClient") then
-            local okType, kind = pcall(typeof, self)
-            if okType and kind == "Instance" then
-                local okName, shortName = pcall(function()
-                    return self.Name
-                end)
-                local okClass, class = pcall(function()
-                    return self.ClassName
-                end)
-                if okName and okClass then
-                    local full = safeName(self)
-                    local key = full .. "|" .. method
-                    local record = capture.records[key]
-                    if not record then
-                        record = {
-                            path = full,
-                            name = shortName,
-                            class = class,
-                            method = method,
-                            count = 0,
-                            first = now(),
-                        }
-                        capture.records[key] = record
-                        capture.count = capture.count + 1
-                    end
-                    record.count = record.count + 1
-                end
+        if capture.active then
+            local method = methodFn()
+            if method == "FireServer" or method == "InvokeServer" then
+                pcall(recordRemote, self, method)
             end
         end
-        if passThrough then
-            return passThrough(self, ...)
+        if original then
+            return original(self, ...)
         end
     end
 
-    local ok, original = pcall(hookFn, game, "__namecall", wrapper)
-    if not ok or type(original) ~= "function" then
+    local ok, previous = pcall(hookFn, game, "__namecall", wrapper)
+    if not ok or type(previous) ~= "function" then
         addLine("capture hook failed", COL.danger)
         return false
     end
 
-    passThrough = passThrough or original
-    capture.original = original
+    original = previous
+    capture.original = previous
     capture.wrapper = wrapper
     capture.active = true
     return true
