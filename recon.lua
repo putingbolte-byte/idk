@@ -1174,8 +1174,8 @@ local function startCapture()
 
     local wrapper = function(self, ...)
         local method = methodFn()
-        if method == "FireServer" or method == "InvokeServer"
-            or method == "FireAllClients" or method == "InvokeClient" then
+        if capture.active and (method == "FireServer" or method == "InvokeServer"
+            or method == "FireAllClients" or method == "InvokeClient") then
             local okType, kind = pcall(typeof, self)
             if okType and kind == "Instance" then
                 local okName, shortName = pcall(function()
@@ -1270,6 +1270,11 @@ local function restoreNamecall()
     end
     return restored
 end
+
+-- escape hatch. if a restore ever wedges mid-session, one line in the console
+-- puts __namecall back without re-running the whole recon suite:
+--   _G.__rea_restore_namecall()
+_G.__rea_restore_namecall = restoreNamecall
 
 local function stopCapture()
     if not capture.active then
