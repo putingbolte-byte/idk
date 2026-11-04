@@ -1332,6 +1332,8 @@ end
 -- rank
 ----------------------------------------------------------------------------
 
+local rankCache = { list = {} }
+
 local function rankRemotes()
     addRule("ranking")
 
@@ -1404,6 +1406,7 @@ local function rankRemotes()
         addLine(("[%d]%s %s"):format(entry.risk, entry.live and " *" or "  ", entry.path), color)
     end
 
+    rankCache.list = list
     rankRemotes.list = list
 end
 
@@ -1524,11 +1527,10 @@ local function probeRemotes()
     -- rankRemotes sets .list at the very end; if anything above it threw, the
     -- list is nil and the probe pass quietly did nothing. rebuild from the walk
     -- results instead of trusting one call site.
-    local list = rankRemotes.list
+    local list = rankCache.list
     if type(list) ~= "table" or #list == 0 then
         addLine("rank list empty — rebuilding from walk results", COL.amber)
-        pcall(rankRemotes)
-        list = rankRemotes.list or {}
+        list = {}
 
         if #list == 0 then
             list = {}
