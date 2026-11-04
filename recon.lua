@@ -2460,7 +2460,13 @@ local function relayout()
     local width = math.min(360, math.max(240, viewport.X - 16))
     local height = math.min(math.max(viewport.Y - 16, 220), 640)
 
-    local twoColumns = width >= 300
+    -- 1-column is 246px of buttons. on a short viewport that is more than the
+    -- whole panel, so fall back to the 2-column grid even when narrow —
+    -- 120px buttons still fit "SAFE: ON" at text size 12
+    local oneColumnHeight = 6 * BUTTON_H + 5 * BUTTON_GAP
+    local needsTwoColumns = (height - HEADER_H - 110) < oneColumnHeight
+
+    local twoColumns = width >= 300 or needsTwoColumns
     buttonGrid.FillDirectionMaxCells = twoColumns and 2 or 1
     buttonGrid.CellSize = twoColumns
         and UDim2.new(0.5, -4, 0, BUTTON_H)
