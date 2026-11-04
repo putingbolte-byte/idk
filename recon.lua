@@ -58,8 +58,13 @@ local CONFIG = {
     bytecodeScriptCap = 900,
     bytecodeCap = 220000,
 
-    captureWindow = 8,
+    -- FALSE by default. hooking __namecall on Delta/Android can kill the client
+    -- outright. capture only runs when explicitly armed from the button, and
+    -- even then with a short window and a small budget.
+    captureHook = false,
+    captureWindow = 6,
     captureCap = 4000,
+    captureBudget = 250,
 
     probeCap = 40,
     probeTimeout = 0.6,
@@ -1227,6 +1232,12 @@ local function startCapture()
 
     local wrapper = function(self, ...)
         if capture.active then
+            capture.budget = (capture.budget or 0) - 1
+            if capture.budget <= 0 then
+                capture.active = false
+                capture.records = capture.records or {}
+                capture._autostopped = true
+            end
             local method = methodFn()
             if method == "FireServer" or method == "InvokeServer" then
                 pcall(recordRemote, self, method)
@@ -1247,6 +1258,8 @@ local function startCapture()
     capture.original = previous
     capture.wrapper = wrapper
     capture.active = true
+    capture.budget = CONFIG.captureBudget
+    capture._autostopped = false
     return true
 end
 
@@ -2497,7 +2510,7 @@ autoButton.Activated:Connect(function()
             setStatus("BUSY", "pipeline already running", COL.amber)
             return
         end
-        runPipeline({ capture = true, probe = true })
+        runPipeline({ capture = CONFIG.captureHook, probe = true })
     end)
 end)
 
