@@ -574,6 +574,25 @@ local function safeParent(inst)
     return ok and parent or nil
 end
 
+-- os.clock() is CPU time in Luau, not wall time. a task.wait loop burns almost
+-- no CPU, so a deadline built on os.clock() never arrives — which is exactly
+-- how the probe pass silently returned zero results. wall clock only.
+local function now()
+    local ok, millis = pcall(function()
+        return DateTime.now().UnixTimestampMillis
+    end)
+    if ok and type(millis) == "number" then
+        return millis / 1000
+    end
+    local okTick, value = pcall(function()
+        return tick()
+    end)
+    if okTick and type(value) == "number" then
+        return value
+    end
+    return os.time()
+end
+
 local function yieldEvery(index)
     if index % CONFIG.yieldEvery == 0 then
         task.wait()
@@ -1156,7 +1175,7 @@ local function startCapture()
                             class = class,
                             method = method,
                             count = 0,
-                            first = os.clock(),
+                            first = now(),
                         }
                         capture.records[key] = record
                         capture.count = capture.count + 1
@@ -1447,8 +1466,8 @@ local function timedInvoke(remote, timeout, args)
         finished = true
     end)
 
-    local deadline = os.clock() + timeout
-    while not finished and os.clock() < deadline do
+    local deadline = now() + timeout
+    while not finished and now() < deadline do
         task.wait(0.03)
     end
 
@@ -2197,7 +2216,7 @@ local function finishMeta(started)
         job = tostring(game.JobId),
         generated = os.date("%Y-%m-%d %H:%M:%S"),
         version = CONFIG.version,
-        elapsed = os.clock() - started,
+        elapsed = now() - started,
         visited = report.counts.visited or 0,
         remotes = report.counts.remotes or 0,
         scripts = report.counts.scripts or 0,
@@ -2254,8 +2273,8 @@ local function runPipelineInner(options, started)
         addRule(("capture %ds"):format(CONFIG.captureWindow))
         local ok = startCapture()
         if ok then
-            local deadline = os.clock() + CONFIG.captureWindow
-            while os.clock() < deadline do
+            local deadline = now() + CONFIG.captureWindow
+            while now() < deadline do
                 task.wait(0.25)
                 setStatus("CAPTURING",
                     ("%d remotes seen"):format(capture.count), COL.violet)
@@ -2281,7 +2300,7 @@ local function runPipelineInner(options, started)
         pcall(saveReport)
     end
 
-    local elapsed = os.clock() - started
+    local elapsed = now() - started
     setStatus("DONE", ("%.1fs · %d remotes · %d live"):format(
         elapsed, report.counts.remotes or 0, report.counts.captured or 0), COL.green)
     addLine(("pipeline finished in %.1fs"):format(elapsed), COL.green)
@@ -2293,7 +2312,7 @@ local function runPipeline(options)
     end
     busy = true
 
-    local started = os.clock()
+    local started = now()
     local ok, err = pcall(runPipelineInner, options or {}, started)
 
     if not ok then
