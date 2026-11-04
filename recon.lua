@@ -1407,7 +1407,6 @@ local function rankRemotes()
     end
 
     rankCache.list = list
-    rankRemotes.list = list
 end
 
 ----------------------------------------------------------------------------
@@ -1531,20 +1530,16 @@ local function probeRemotes()
     if type(list) ~= "table" or #list == 0 then
         addLine("rank list empty — rebuilding from walk results", COL.amber)
         list = {}
-
-        if #list == 0 then
-            list = {}
-            for _, entry in ipairs(walkResults.remotes) do
-                table.insert(list, {
-                    inst = entry.inst,
-                    path = entry.path,
-                    class = entry.class,
-                    service = entry.service,
-                    risk = riskScore(entry.class, entry.path),
-                    connections = entry.connections or -1,
-                    live = false,
-                })
-            end
+        for _, entry in ipairs(walkResults.remotes) do
+            table.insert(list, {
+                inst = entry.inst,
+                path = entry.path,
+                class = entry.class,
+                service = entry.service,
+                risk = riskScore(entry.class, entry.path),
+                connections = entry.connections or -1,
+                live = false,
+            })
         end
     end
 
