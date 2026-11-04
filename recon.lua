@@ -1516,48 +1516,89 @@ local parseProbes  -- forward declared: probeRemotes calls it before its body
 local function probeRemotes()
     addRule("probe")
 
-    local list = (rankRemotes.list or {})
+    -- rankRemotes sets .list at the very end; if anything above it threw, the
+    -- list is nil and the probe pass quietly did nothing. rebuild from the walk
+    -- results instead of trusting one call site.
+    local list = rankRemotes.list
+    if type(list) ~= "table" or #list == 0 then
+        addLine("rank list empty — rebuilding from walk results", COL.amber)
+        pcall(rankRemotes)
+        list = rankRemotes.list or {}
+
+        if #list == 0 then
+            list = {}
+            for _, entry in ipairs(walkResults.remotes) do
+                table.insert(list, {
+                    inst = entry.inst,
+                    path = entry.path,
+                    class = entry.class,
+                    service = entry.service,
+                    risk = riskScore(entry.class, entry.path),
+                    connections = entry.connections or -1,
+                    live = false,
+                })
+            end
+        end
+    end
+
+    local candidates = {}
+    local mentioned = 0
+    for _, entry in ipairs(list) do
+        if entry.class == "RemoteFunction" then
+            mentioned = mentioned + 1
+            if isProbeSafe(entry) then
+                table.insert(candidates, entry)
+            end
+        end
+    end
+
+    addLine(("%d entries, %d RemoteFunctions, %d probe-safe"):format(
+        #list, mentioned, #candidates), COL.sub)
+
+    if #candidates == 0 then
+        addLine("nothing safe to probe — every RemoteFunction was filtered", COL.amber)
+    end
+
     local results = {}
     local attempted = 0
 
-    for _, entry in ipairs(list) do
+    for _, entry in ipairs(candidates) do
         if attempted >= CONFIG.probeCap then
             break
         end
-        if entry.class == "RemoteFunction" and isProbeSafe(entry) then
-            attempted = attempted + 1
-            setStatus("PROBING", ("%d/%d"):format(attempted, math.min(#list, CONFIG.probeCap)),
-                COL.violet)
+        attempted = attempted + 1
+        setStatus("PROBING", ("%d/%d"):format(attempted, math.min(#candidates, CONFIG.probeCap)),
+            COL.violet)
 
-            jitter()
+        jitter()
 
-            local ok, value = timedInvoke(entry.inst, CONFIG.probeTimeout, {})
-            local record = {
-                path = entry.path,
-                ok = ok,
-                result = ok and describeValue(value) or tostring(value),
-                risk = entry.risk,
-            }
-            table.insert(results, record)
+        local ok, value = timedInvoke(entry.inst, CONFIG.probeTimeout, {})
+        local record = {
+            path = entry.path,
+            ok = ok,
+            result = ok and describeValue(value) or tostring(value),
+            risk = entry.risk,
+        }
+        table.insert(results, record)
 
-            if ok then
-                local text = tostring(record.result)
-                if string.find(text, "^false") or string.find(text, "nil") then
-                    addLine(("  checked   %s"):format(entry.path), COL.sub)
-                else
-                    addLine(("  RETURNS   %s -> %s"):format(entry.path, text), COL.green)
-                end
-            elseif tostring(value) == "timeout" then
-                addLine(("  timeout   %s"):format(entry.path), COL.amber)
+        if ok then
+            local text = tostring(record.result)
+            if string.find(text, "^false") or string.find(text, "nil") then
+                addLine(("  checked   %s"):format(entry.path), COL.sub)
             else
-                addLine(("  error     %s"):format(entry.path), COL.dim)
+                addLine(("  RETURNS   %s -> %s"):format(entry.path, text), COL.green)
             end
+        elseif tostring(value) == "timeout" then
+            addLine(("  timeout   %s"):format(entry.path), COL.amber)
+        else
+            addLine(("  error     %s  (%s)"):format(entry.path, tostring(value)), COL.dim)
         end
     end
 
     report.probes = results
     parseProbes(results)
     addLine(("%d RemoteFunctions probed"):format(#results), COL.cyan)
+
 end
 
 function parseProbes(results)
