@@ -6,10 +6,15 @@
     what it does
       · one tap per waypoint: 5 island buttons, 4 crystals, altar, vault,
         buy spot, grotto, expedition portal, avalanche totem
-      · full auto route: teleport -> fire nearest prompt -> next, in order
-      · chunked teleport (never one giant CFrame snap) + server remote hand-off
-      · stealth governor: rate limit, jitter, per-step cooldowns, error backoff
-      · ground snap after every hop so you don't land inside geometry
+      · full auto route: travel -> press nearest prompt -> next, in order
+      · flight, not a snap: climb -> cruise -> descend, speed capped per frame
+        so the server sees continuous motion instead of a 20k CFrame delta
+      · ghost hold: freezes while a real player is inside the watch radius,
+        resumes when they leave or the hold expires
+      · one prompt at a time, from inside its own MaxActivationDistance,
+        facing it before pressing
+      · bimodal step delays, token bucket, jitter, per-step cooldowns,
+        error backoff, ground snap on landing
 
     keybinds: RSHIFT toggle · END panic · long-press launcher = panic
     mobile: auto-opens, horizontal tab strip, 48px touch targets
@@ -86,24 +91,28 @@ end
 -- ============================================================
 
 local cfg = {
-    -- teleport
+    -- movement
+    mode            = "travel",   -- travel | boost | blink
     useServerRemote = true,
-    chunked         = true,
-    hopSize         = 320,
-    hopDelay        = 0.03,
-    holdTime        = 0.25,
+    speed           = 300,
+    altitude        = 45,
+    settleTime      = 0.45,
     yOffset         = 3,
     groundSnap      = true,
+    -- witness avoidance
+    ghost           = true,
+    ghostRadius     = 160,
+    ghostHold       = 30,
     -- route
     autoRoute       = false,
-    stepDelay       = 1.2,
-    promptRadius    = 26,
+    stepDelay       = 2.4,
+    promptRadius    = 9,
     skipYellow      = true,
     stopOnMissing   = false,
     -- stealth
     stealth         = true,
-    jitter          = 0.15,
-    rateLimit       = 14,
+    jitter          = 0.4,
+    rateLimit       = 10,
     -- ui
     tab             = "Route",
 }
@@ -112,9 +121,10 @@ local CONFIG_PATH = "heavenslua_config.json"
 local saveQueued = false
 
 local SAVE_KEYS = {
-    "useServerRemote", "chunked", "hopSize", "hopDelay", "holdTime",
-    "yOffset", "groundSnap", "autoRoute", "stepDelay", "promptRadius",
-    "skipYellow", "stopOnMissing", "stealth", "jitter", "rateLimit", "tab",
+    "mode", "useServerRemote", "speed", "altitude", "settleTime",
+    "yOffset", "groundSnap", "ghost", "ghostRadius", "ghostHold",
+    "autoRoute", "stepDelay", "promptRadius", "skipYellow", "stopOnMissing",
+    "stealth", "jitter", "rateLimit", "tab",
 }
 
 local function serializeConfig()
@@ -166,14 +176,19 @@ local function loadConfig()
         local v = data[k]
         if v ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
     end
-    cfg.hopSize      = math.clamp(tonumber(cfg.hopSize) or 320, 80, 1200)
-    cfg.hopDelay     = math.clamp(tonumber(cfg.hopDelay) or 0.03, 0.01, 0.4)
-    cfg.holdTime     = math.clamp(tonumber(cfg.holdTime) or 0.25, 0, 2)
-    cfg.yOffset      = math.clamp(tonumber(cfg.yOffset) or 3, -20, 60)
-    cfg.stepDelay    = math.clamp(tonumber(cfg.stepDelay) or 1.2, 0.2, 10)
-    cfg.promptRadius = math.clamp(tonumber(cfg.promptRadius) or 26, 6, 120)
-    cfg.jitter       = math.clamp(tonumber(cfg.jitter) or 0.15, 0, 1)
-    cfg.rateLimit    = math.clamp(tonumber(cfg.rateLimit) or 14, 1, 80)
+    if cfg.mode ~= "travel" and cfg.mode ~= "boost" and cfg.mode ~= "blink" then
+        cfg.mode = "travel"
+    end
+    cfg.speed         = math.clamp(tonumber(cfg.speed) or 300, 60, 2000)
+    cfg.altitude      = math.clamp(tonumber(cfg.altitude) or 45, 5, 400)
+    cfg.settleTime    = math.clamp(tonumber(cfg.settleTime) or 0.45, 0, 3)
+    cfg.yOffset       = math.clamp(tonumber(cfg.yOffset) or 3, -20, 60)
+    cfg.ghostRadius   = math.clamp(tonumber(cfg.ghostRadius) or 160, 20, 600)
+    cfg.ghostHold     = math.clamp(tonumber(cfg.ghostHold) or 30, 2, 180)
+    cfg.stepDelay     = math.clamp(tonumber(cfg.stepDelay) or 2.4, 0.4, 12)
+    cfg.promptRadius  = math.clamp(tonumber(cfg.promptRadius) or 9, 3, 14)
+    cfg.jitter        = math.clamp(tonumber(cfg.jitter) or 0.4, 0, 1)
+    cfg.rateLimit     = math.clamp(tonumber(cfg.rateLimit) or 10, 1, 60)
     return true
 end
 
@@ -291,8 +306,7 @@ local WAYPOINTS = {
 -- ============================================================
 
 local function getChar()
-    local char = lp.Character
-    return char
+    return lp.Character
 end
 
 local function getRoot()
@@ -317,7 +331,6 @@ end
 local function groundSnap(pos)
     if not cfg.groundSnap then return pos + Vector3.new(0, cfg.yOffset, 0) end
     local params = Instance.new("RaycastParams")
-    -- default FilterType is already "exclude"; only pin it where the name exists
     pcall(function() params.FilterType = Enum.RaycastFilterType.Exclude end)
     local char = getChar()
     pcall(function()
@@ -330,19 +343,179 @@ local function groundSnap(pos)
     return pos + Vector3.new(0, cfg.yOffset, 0)
 end
 
-local function setCF(pos)
+local function setCF(pos, lookAt)
     local root = getRoot()
     if not root then return false end
-    pcall(function()
-        root.CFrame = CFrame.new(pos)
+    local ok = pcall(function()
+        if lookAt then
+            root.CFrame = CFrame.lookAt(pos, lookAt)
+        else
+            root.CFrame = CFrame.new(pos)
+        end
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end)
+    return ok
+end
+
+-- nobody watching? if a real player is inside the radius we stop moving
+-- until they leave or the hold expires. teleporting in someone's view is
+-- the single most reportable thing a client can do.
+local function witnessed()
+    if not cfg.ghost then return false end
+    local root = getRoot()
+    if not root then return false end
+    local origin = root.Position
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= lp then
+            local chr = plr.Character
+            local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr:FindFirstChild("Torso"))
+            if hrp then
+                local d = (hrp.Position - origin).Magnitude
+                if d <= cfg.ghostRadius then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- hover in place while watched: reassert the CFrame each tick so gravity
+-- doesn't drop us out of the sky and give the freeze away.
+local function ghostHold(pos)
+    if not cfg.ghost then return end
+    local waited = 0
+    while witnessed() and waited < cfg.ghostHold do
+        if not running then return end
+        if pos then setCF(pos) end
+        task.wait(0.4)
+        waited = waited + 0.4
+    end
+end
+
+-- speed tapers on approach so the stop is a landing, not a wall
+local function speedFor(remaining, total, base)
+    local frac = total > 0 and math.clamp(remaining / total, 0, 1) or 0
+    return base * (0.55 + 0.45 * math.clamp(frac * 2, 0, 1))
+end
+
+-- per-frame flight. each tick moves at most speed*dt studs, so the
+-- server sees a body moving at human-ish delta instead of a 20k snap.
+local function cruiseTo(dest, baseSpeed, timeout)
+    local root = getRoot()
+    if not root then return false, "no character" end
+    unseat()
+
+    local start  = root.Position
+    local total  = (dest - start).Magnitude
+    if total < 6 then return true end
+
+    local speed = math.clamp(baseSpeed or cfg.speed, 40, 2000)
+    local deadline = os.clock() + (timeout or (total / speed * 2.5 + 12))
+    local last, lastPos = os.clock(), start
+    local stuck = 0
+    local phase = math.random() * math.pi * 2
+
+    while os.clock() < deadline do
+        if not running then return false, "aborted" end
+        local r = getRoot()
+        if not r then return false, "lost character" end
+        if witnessed() then
+            local holdStart = os.clock()
+            ghostHold(r.Position)
+            -- standing still is not the script's fault; don't count it
+            deadline = deadline + (os.clock() - holdStart)
+        end
+        local cur = r.Position
+        local remaining = (dest - cur).Magnitude
+        if remaining < 4 then return true end
+
+        local t = os.clock()
+        local dt = math.clamp(t - last, 0.008, 0.05)
+        last = t
+
+        local step = math.min(speedFor(remaining, total, speed) * dt, remaining)
+        local dir = (dest - cur).Unit
+        local nextPos = cur + dir * step
+
+        -- a dead-straight line is its own fingerprint; drift a few studs
+        -- sideways on a slow sine, tapering to zero on final approach
+        local flatDir = Vector3.new(dir.X, 0, dir.Z)
+        if flatDir.Magnitude > 0.01 then
+            local side = flatDir.Unit:Cross(Vector3.new(0, 1, 0))
+            local amp = math.min(5, remaining * 0.1)
+            nextPos = nextPos + side * (math.sin(t * 1.9 + phase) * amp)
+        end
+
+        setCF(nextPos, dest)
+
+        if (cur - lastPos).Magnitude < step * 0.2 then
+            stuck = stuck + 1
+            if stuck > 60 then return false, "blocked" end
+        else
+            stuck = 0
+        end
+        lastPos = cur
+
+        task.wait()
+    end
+    return false, "timeout"
+end
+
+-- climb -> cruise -> descend. three legs, none of them a straight line
+-- through terrain, each one individually sub-flagable.
+local function travelTo(dest)
+    local root = getRoot()
+    if not root then return false, "no character" end
+    local origin = root.Position
+    local base = (cfg.mode == "boost") and cfg.speed * 1.9 or cfg.speed
+
+    local flat = Vector3.new(dest.X, origin.Y, dest.Z)
+    if (flat - origin).Magnitude < 12 and math.abs(dest.Y - origin.Y) < 12 then
+        unseat()
+        setCF(dest)
+        task.wait(cfg.settleTime)
+        return true, "arrived"
+    end
+
+    local cruiseY = math.max(origin.Y, dest.Y) + cfg.altitude
+
+    if math.abs(cruiseY - origin.Y) > 6 then
+        local climb = Vector3.new(origin.X, cruiseY, origin.Z)
+        local ok = cruiseTo(climb, base * 0.8, 20)
+        if not ok then return false, "climb failed" end
+        task.wait(cfg.settleTime * 0.5)
+    end
+
+    local cruiseDest = Vector3.new(dest.X, cruiseY, dest.Z)
+    local ok2 = cruiseTo(cruiseDest, base)
+    if not ok2 then return false, "cruise failed" end
+    task.wait(cfg.settleTime * 0.5)
+
+    local ok3 = cruiseTo(dest, math.max(120, base * 0.7), 25)
+    if not ok3 then return false, "descent failed" end
+
+    setCF(dest)
+    task.wait(cfg.settleTime)
     return true
 end
 
--- server-side hand-off first: if the game grants the teleport, we never
--- touch the character transform at all, which is the cleanest signal.
+local function blinkTo(dest)
+    if witnessed() then
+        return travelTo(dest)
+    end
+    unseat()
+    if not setCF(dest) then return false, "no character" end
+    task.wait(cfg.settleTime)
+    return true, "blink"
+end
+
+local function hopLocal(dest)
+    if cfg.mode == "blink" then return blinkTo(dest) end
+    return travelTo(dest)
+end
+
+-- server-side hand-off first: if the game grants the move we never touch
+-- the transform at all, which is the cleanest possible signal.
 local function tryServerTeleport(pos)
     if not cfg.useServerRemote then return false end
     if not gate("tp.server", 1.5) then return false end
@@ -364,46 +537,11 @@ local function tryServerTeleport(pos)
     return false
 end
 
--- chunked local hop: splits the trip so no single frame carries a
--- 20,000-stud delta. this is the anti-flag part.
-local function localTeleport(pos)
-    local root = getRoot()
-    if not root then return false, "no character" end
-    unseat()
-
-    local start = root.CFrame.Position
-    local dist = (pos - start).Magnitude
-
-    if cfg.chunked and dist > cfg.hopSize then
-        local steps = math.clamp(math.ceil(dist / cfg.hopSize), 2, 40)
-        for i = 1, steps do
-            if not running then return false, "aborted" end
-            local t = i / steps
-            setCF(start:Lerp(pos, t))
-            task.wait(cfg.hopDelay + math.random() * 0.02)
-        end
-    else
-        setCF(pos)
-    end
-
-    -- hold: reassert for a moment in case the server snapped us back
-    local deadline = os.clock() + cfg.holdTime
-    while os.clock() < deadline do
-        if not running then return false, "aborted" end
-        local r = getRoot()
-        if r and (r.Position - pos).Magnitude > 12 then
-            setCF(pos)
-        end
-        task.wait(0.05)
-    end
-    return true
-end
-
--- server hand-off, then verify; fall back to the chunked local hop.
--- the verify step matters: a RemoteFunction returning without error does
--- not mean the server moved us, so we measure before trusting it.
+-- server hand-off, verify distance, then fall back to local flight.
+-- a RemoteFunction that returns without error has not necessarily moved
+-- you, so measure before trusting it.
 local function hopTo(target)
-    if cfg.useServerRemote then
+    if cfg.useServerRemote and cfg.mode ~= "blink" then
         if tryServerTeleport(target) then
             task.wait(0.5 + math.random() * 0.25)
             local root = getRoot()
@@ -412,8 +550,7 @@ local function hopTo(target)
             end
         end
     end
-    local ok, err = localTeleport(target)
-    return ok, err
+    return hopLocal(target)
 end
 
 local function teleportTo(wp, quiet)
@@ -492,25 +629,67 @@ local function firePrompt(p)
     return ok
 end
 
-local function fireNearbyPrompts(radius)
+-- one prompt at a time, from inside its real activation range, facing it.
+-- firing several in a frame is the loud version; this is the quiet one.
+local function pressNearest()
     local root = getRoot()
     if not root then return 0 end
-    if os.clock() - promptCacheAt > 5 then rebuildPromptCache() end
+    if os.clock() - promptCacheAt > 4 then rebuildPromptCache() end
 
     local origin = root.Position
-    local fired = 0
+    local best, bestPos, bestDist
+
     for _, p in ipairs(promptCache) do
         if p.Parent and p.Enabled then
             local pos = promptPos(p)
-            if pos and (pos - origin).Magnitude <= radius then
-                if firePrompt(p) then
-                    fired = fired + 1
-                    task.wait(0.1 + math.random() * 0.12)
+            if pos then
+                local d = (pos - origin).Magnitude
+                if d <= cfg.promptRadius and (not bestDist or d < bestDist) then
+                    local okMax, maxDist = pcall(function() return p.MaxActivationDistance end)
+                    if not okMax or type(maxDist) ~= "number" then maxDist = 10 end
+                    -- never reach further than the prompt itself allows
+                    local limit = math.min(cfg.promptRadius, maxDist + 1.5)
+                    if d <= limit then
+                        best, bestPos, bestDist = p, pos, d
+                    end
                 end
             end
         end
     end
-    return fired
+
+    if not best then return 0 end
+
+    -- face it before touching it, like a body would
+    pcall(function()
+        local r = getRoot()
+        if r then
+            r.CFrame = CFrame.lookAt(r.Position, Vector3.new(bestPos.X, r.Position.Y, bestPos.Z))
+        end
+    end)
+    task.wait(0.28 + math.random() * 0.55)
+
+    if not gate("prompt", 0.5) then
+        task.wait(0.3)
+        if not gate("prompt", 0.5) then return 0 end
+    end
+
+    if firePrompt(best) then
+        task.wait(0.2 + math.random() * 0.35)
+        return 1
+    end
+    return 0
+end
+
+-- kept as the page-facing name: press what is here, at most three times
+local function fireNearbyPrompts(_radius)
+    local total = 0
+    for _ = 1, 3 do
+        local n = pressNearest()
+        if n == 0 then break end
+        total = total + n
+        task.wait(0.3 + math.random() * 0.5)
+    end
+    return total
 end
 
 -- ============================================================
@@ -608,37 +787,54 @@ local function routeList()
     return out
 end
 
+-- bimodal: mostly a normal pause, sometimes a distraction, sometimes brisk.
+-- a flat delay is a timing signature even when it has jitter on top.
+local function humanDelay(base)
+    local b = base or cfg.stepDelay
+    local roll = math.random()
+    if roll < 0.15 then return b * 2.1 end
+    if roll > 0.90 then return b * 0.55 end
+    return b * (0.85 + math.random() * 0.35)
+end
+
 local function runRoute()
     if routeThread then return end
     routeThread = task.spawn(function()
         cfg.autoRoute = true
         local list = routeList()
-        statusLabel.Text = "route · " .. #list .. " steps"
+        if statusLabel then statusLabel.Text = "route · " .. #list .. " steps" end
+
         for i, wp in ipairs(list) do
             if not running or not cfg.autoRoute then break end
             currentIndex = i
-            statusLabel.Text = string.format("step %d/%d · %s", i, #list, wp.name)
+            if statusLabel then
+                statusLabel.Text = string.format("step %d/%d · %s", i, #list, wp.name)
+            end
+
             local ok = teleportTo(wp, true)
             if ok then
-                task.wait(0.35 + math.random() * 0.2)
+                task.wait(0.4 + math.random() * 0.3)
                 local fired = fireNearbyPrompts(cfg.promptRadius)
                 if fired == 0 and cfg.stopOnMissing then
-                    statusLabel.Text = "stopped · no prompt at " .. wp.name
+                    if statusLabel then
+                        statusLabel.Text = "stopped · no prompt at " .. wp.name
+                    end
                     break
                 end
             end
-            task.wait(cfg.stepDelay)
+            task.wait(humanDelay(cfg.stepDelay))
         end
+
         cfg.autoRoute = false
         routeThread = nil
-        statusLabel.Text = "route finished"
+        if statusLabel then statusLabel.Text = "route finished" end
     end)
 end
 
 local function stopRoute()
     cfg.autoRoute = false
     routeThread = nil
-    statusLabel.Text = "route stopped"
+    if statusLabel then statusLabel.Text = "route stopped" end
 end
 
 -- beacon follows the active step during a run
@@ -805,7 +1001,7 @@ create("TextLabel", {
     TextSize = 11,
     TextColor3 = COL.sub,
     TextXAlignment = Enum.TextXAlignment.Left,
-    Text = "chunked teleport · stealth governor on",
+    Text = "per-frame flight · ghost hold · stealth governor",
     ZIndex = 4,
 }, header)
 
@@ -1318,6 +1514,83 @@ end
 -- PAGES
 -- ============================================================
 
+-- segmented control: three states max, all visible, one tap each
+local function makeModeRow(parent, title, key, options)
+    local row = rowShell(parent, 68)
+    create("TextLabel", {
+        Position = UDim2.fromOffset(14, 8),
+        Size = UDim2.new(1, -28, 0, 17),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextColor3 = COL.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = title,
+        ZIndex = 4,
+    }, row)
+
+    local strip = create("Frame", {
+        Position = UDim2.fromOffset(14, 32),
+        Size = UDim2.new(1, -28, 0, 26),
+        BackgroundColor3 = COL.off,
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    }, row)
+    create("UICorner", { CornerRadius = UDim.new(0, 8) }, strip)
+    create("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, strip)
+
+    local buttons = {}
+    local function refresh()
+        for value, btn in pairs(buttons) do
+            local active = (cfg[key] == value)
+            tween(btn, {
+                BackgroundColor3 = active and COL.cyan or COL.off,
+                BackgroundTransparency = active and 0.78 or 1,
+            }, 0.12)
+            local lbl = btn:FindFirstChildOfClass("TextLabel")
+            if lbl then
+                lbl.TextColor3 = active and COL.text or COL.sub
+            end
+        end
+    end
+
+    for i, opt in ipairs(options) do
+        local btn = create("TextButton", {
+            Size = UDim2.new(1 / #options, -4, 1, 0),
+            BackgroundColor3 = COL.off,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = "",
+            AutoButtonColor = false,
+            LayoutOrder = i,
+            ZIndex = 5,
+        }, strip)
+        create("UICorner", { CornerRadius = UDim.new(0, 7) }, btn)
+        create("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 10,
+            TextColor3 = COL.sub,
+            Text = opt.label or opt.value,
+            ZIndex = 6,
+        }, btn)
+        btn.Activated:Connect(function()
+            cfg[key] = opt.value
+            refresh()
+            queueSave()
+        end)
+        buttons[opt.value] = btn
+    end
+
+    refresh()
+    return row
+end
+
 local function waypointRow(wp)
     local tag = wp.optional and "  ·  optional" or ""
     return makeActionRow(content, wp.name, fmt(wp.pos) .. tag, function()
@@ -1352,33 +1625,39 @@ end
 
 pages.Sequence = function()
     addSection(content, "auto route")
-    makeActionRow(content, "Run Full Route", "teleport + press every prompt in order", function()
+    makeActionRow(content, "Run Full Route", "fly + press every prompt in order", function()
         currentIndex = 0
         runRoute()
     end)
     makeActionRow(content, "Stop Route", "abort at the current step", function()
         stopRoute()
     end)
-    makeActionRow(content, "Press Prompts Here", "fire whatever is nearby right now", function()
+    makeActionRow(content, "Press Prompts Here", "single nearest prompt, like a hand", function()
         local n = fireNearbyPrompts(cfg.promptRadius)
         statusLabel.Text = string.format("fired %d prompt%s", n, n == 1 and "" or "s")
     end)
 
+    addSection(content, "movement")
+    makeModeRow(content, "Travel Mode", "mode", {
+        { value = "travel", label = "FLY" },
+        { value = "boost",  label = "BOOST" },
+        { value = "blink",  label = "BLINK" },
+    })
+    makeSliderRow(content, "Speed", "studs per second while cruising", "speed", 60, 1200)
+    makeSliderRow(content, "Altitude", "height above the higher point", "altitude", 5, 200)
+    makeSliderRow(content, "Settle Time", "pause on landing before acting", "settleTime", 0, 2, true)
+
     addSection(content, "behaviour")
     makeToggleRow(content, "Skip Yellow Crystal", "avalanche-only step", "skipYellow")
     makeToggleRow(content, "Stop If No Prompt", "halt when a step finds nothing", "stopOnMissing")
-    makeSliderRow(content, "Step Delay", "wait between route steps", "stepDelay", 0.4, 5, true)
-    makeSliderRow(content, "Prompt Radius", "studs around you to search", "promptRadius", 8, 80)
+    makeSliderRow(content, "Step Delay", "base pause between route steps", "stepDelay", 0.4, 8, true)
+    makeSliderRow(content, "Prompt Radius", "studs around you to search", "promptRadius", 3, 14)
 end
 
 pages.Teleport = function()
     addSection(content, "transport")
     makeToggleRow(content, "Server Teleport First", "ask the game before moving locally", "useServerRemote")
-    makeToggleRow(content, "Chunked Hop", "split long trips into short steps", "chunked")
     makeToggleRow(content, "Ground Snap", "raycast down after arrival", "groundSnap")
-    makeSliderRow(content, "Hop Size", "max studs per chunk", "hopSize", 80, 1200)
-    makeSliderRow(content, "Hop Delay", "seconds between chunks", "hopDelay", 0.01, 0.4, true)
-    makeSliderRow(content, "Hold Time", "reassert position for this long", "holdTime", 0, 2, true)
     makeSliderRow(content, "Y Offset", "lift above the surface", "yOffset", -20, 60)
 
     addSection(content, "custom target")
@@ -1414,9 +1693,14 @@ pages.Teleport = function()
 end
 
 pages.Stealth = function()
+    addSection(content, "ghost mode")
+    makeToggleRow(content, "Ghost Hold", "freeze while a player can see you", "ghost")
+    makeSliderRow(content, "Ghost Radius", "studs that count as being watched", "ghostRadius", 20, 600)
+    makeSliderRow(content, "Ghost Hold Max", "longest freeze before moving anyway", "ghostHold", 2, 180)
+
     addSection(content, "bypass layer")
     makeToggleRow(content, "Stealth Governor", "jitter + rate limit + backoff", "stealth")
-    makeSliderRow(content, "Jitter", "random delay before remote calls", "jitter", 0, 0.8, true)
+    makeSliderRow(content, "Jitter", "random delay before remote calls", "jitter", 0, 1, true)
     makeSliderRow(content, "Rate Limit", "max remote calls per second", "rateLimit", 1, 60)
 
     addSection(content, "notes")
@@ -1443,20 +1727,23 @@ pages.Config = function()
         statusLabel.Text = "config reloaded"
     end)
     makeActionRow(content, "Reset Config", "restore defaults", function()
+        cfg.mode = "travel"
         cfg.useServerRemote = true
-        cfg.chunked = true
-        cfg.hopSize = 320
-        cfg.hopDelay = 0.03
-        cfg.holdTime = 0.25
+        cfg.speed = 300
+        cfg.altitude = 45
+        cfg.settleTime = 0.45
         cfg.yOffset = 3
         cfg.groundSnap = true
-        cfg.stepDelay = 1.2
-        cfg.promptRadius = 26
+        cfg.ghost = true
+        cfg.ghostRadius = 160
+        cfg.ghostHold = 30
+        cfg.stepDelay = 2.4
+        cfg.promptRadius = 9
         cfg.skipYellow = true
         cfg.stopOnMissing = false
         cfg.stealth = true
-        cfg.jitter = 0.15
-        cfg.rateLimit = 14
+        cfg.jitter = 0.4
+        cfg.rateLimit = 10
         saveConfig()
         showTab("Route")
         statusLabel.Text = "config reset"
