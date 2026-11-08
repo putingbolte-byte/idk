@@ -25,6 +25,7 @@ MAP=(
     "/root/wp.lua:wp.lua"
     "/root/firetest.lua:firetest.lua"
     "/root/deadshift.lua:deadshift.lua"
+    "/root/fisch.lua:fisch.lua"
 )
 
 changed=()

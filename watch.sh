@@ -15,6 +15,7 @@ SOURCES=(
     /root/hit.lua
     /root/wp.lua
     /root/firetest.lua
+    /root/fisch.lua
 )
 
 fingerprint() {
